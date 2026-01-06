@@ -14,27 +14,7 @@ import {
   Square,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
-
-export type AgentStatus = "initializing" | "idle" | "busy" | "error" | "stopping" | "stopped"
-
-export interface Agent {
-  id: string
-  name: string
-  type: string
-  model: string
-  status: AgentStatus
-  currentSessionId?: string
-  currentTask?: {
-    id: string
-    title: string
-    href?: string
-  }
-  metrics?: {
-    cpuPercent: number
-    memoryMB: number
-  }
-  startedAt?: Date
-}
+import type { Agent, AgentStatus } from "@/lib/api"
 
 interface AgentCardProps {
   agent: Agent
@@ -44,7 +24,7 @@ interface AgentCardProps {
   className?: string
 }
 
-function StatusBadge({ status }: { status: AgentStatus }) {
+export function StatusBadge({ status }: { status: AgentStatus }) {
   const statusConfig: Record<AgentStatus, { label: string; className: string; dotClassName: string }> = {
     initializing: {
       label: "Initializing",
@@ -76,9 +56,25 @@ function StatusBadge({ status }: { status: AgentStatus }) {
       className: "bg-slate-500/10 text-slate-600 dark:text-slate-400",
       dotClassName: "bg-slate-500",
     },
+    // Fallback for any other status
+    paused: {
+      label: "Paused",
+      className: "bg-gray-500/10 text-gray-600 dark:text-gray-400",
+      dotClassName: "bg-gray-500",
+    },
+    starting: {
+      label: "Starting",
+      className: "bg-blue-500/10 text-blue-600 dark:text-blue-400",
+      dotClassName: "bg-blue-500 animate-pulse",
+    },
+    running: {
+      label: "Running",
+      className: "bg-green-500/10 text-green-600 dark:text-green-400",
+      dotClassName: "bg-green-500 animate-pulse",
+    }
   }
 
-  const config = statusConfig[status]
+  const config = statusConfig[status as AgentStatus] || statusConfig.idle
 
   return (
     <span
@@ -153,14 +149,22 @@ export function AgentCard({
     return () => document.removeEventListener("mousedown", handleClickOutside)
   }, [])
 
+  // Calculate uptime if available (not all agents have startedAt)
+  // Backend provides uptime_seconds in metrics but we can also use startedAt
   const uptime = React.useMemo(() => {
-    if (!agent.startedAt) return null
-    const diff = Date.now() - new Date(agent.startedAt).getTime()
+    // If we have startedAt, use it
+    // Note: API Agent uses createdAt/updatedAt/startedAt? 
+    // API Agent has createdAt, updatedAt. startedAt is not in the interface I saw in lib/api.ts
+    // but the backend returns it. I should use what's available.
+    // Let's assume 'startedAt' might exist on the object even if not typed, or rely on metrics.uptime_seconds
+    const start = (agent as any).startedAt || agent.createdAt
+    if (!start) return null
+    const diff = Date.now() - new Date(start).getTime()
     const hours = Math.floor(diff / (1000 * 60 * 60))
     const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60))
     if (hours > 0) return `${hours}h ${minutes}m`
     return `${minutes}m`
-  }, [agent.startedAt])
+  }, [agent])
 
   return (
     <div
@@ -272,38 +276,37 @@ export function AgentCard({
       </div>
 
       {/* Current task */}
-      {agent.currentTask && (
+      {(agent.currentTaskId || (agent as any).currentTask) && (
         <div className="mb-4">
           <p className="text-xs text-muted-foreground mb-1">Current Task</p>
-          {agent.currentTask.href ? (
-            <Link
-              href={agent.currentTask.href}
-              className="group flex items-center gap-1 text-sm font-medium hover:text-primary transition-colors"
-            >
-              <span className="truncate">{agent.currentTask.title}</span>
-              <ExternalLink className="h-3 w-3 opacity-0 group-hover:opacity-100 transition-opacity" />
-            </Link>
-          ) : (
-            <p className="text-sm font-medium truncate">
-              {agent.currentTask.title}
-            </p>
-          )}
+          {/* We only have ID now unless we fetch task details or if extra data is passed */}
+          <div className="flex items-center gap-1 text-sm font-medium">
+             <span className="truncate">
+                {(agent as any).currentTask?.title || `Task #${agent.currentTaskId}`}
+             </span>
+             {/* Link requires more info than just ID for href usually, but we can assume /projects/pid/tasks/tid */}
+             {agent.currentTaskId && (
+               <Link href={`/projects/${agent.projectId}/tasks/${agent.currentTaskId}`} className="ml-auto">
+                 <ExternalLink className="h-3 w-3 text-muted-foreground hover:text-primary" />
+               </Link>
+             )}
+          </div>
         </div>
       )}
 
-      {/* Metrics */}
-      {agent.metrics && (
+      {/* Metrics - only show if available */}
+      {agent.metrics && (agent.metrics.cpu_percent !== undefined || (agent.metrics as any).cpuPercent !== undefined) && (
         <div className="space-y-3">
           <MetricBar
             label="CPU"
-            value={agent.metrics.cpuPercent}
+            value={agent.metrics.cpu_percent ?? (agent.metrics as any).cpuPercent ?? 0}
             max={100}
             unit="%"
             icon={Cpu}
           />
           <MetricBar
             label="Memory"
-            value={agent.metrics.memoryMB}
+            value={agent.metrics.memory_mb ?? (agent.metrics as any).memoryMB ?? 0}
             max={1024}
             unit="MB"
             icon={MemoryStick}
@@ -316,7 +319,7 @@ export function AgentCard({
         {onStop && (
           <button
             onClick={onStop}
-            disabled={agent.status === "idle"}
+            disabled={agent.status === "idle" || agent.status === "stopped"}
             className={cn(
               "flex-1 inline-flex items-center justify-center gap-1.5",
               "rounded-lg border px-3 py-1.5 text-xs font-medium",

@@ -9,6 +9,7 @@ import {
   type UpdateTaskInput,
   type TaskStatus,
   type Agent,
+  type SpawnAgentInput,
   type PaginationParams,
 } from '@/lib/api'
 
@@ -269,6 +270,21 @@ export function useAgent(id: string) {
     queryFn: () => api.agents.get(id),
     select: (response) => response.data,
     enabled: !!id,
+  })
+}
+
+export function useSpawnAgent() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: (data: SpawnAgentInput) => api.agents.spawn(data),
+    onSuccess: (response) => {
+      const agent = response.data
+      queryClient.setQueryData(queryKeys.agents.detail(agent.id), response)
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.agents.list(agent.projectId),
+      })
+    },
   })
 }
 

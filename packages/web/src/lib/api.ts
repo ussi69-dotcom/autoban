@@ -132,6 +132,17 @@ export type AgentType =
   | 'librarian'
   | 'document-writer'
 
+export interface AgentMetrics {
+  total_sessions: number
+  completed_tasks: number
+  failed_tasks: number
+  total_tokens_used: number
+  average_response_time_ms: number
+  uptime_seconds: number
+  cpu_percent?: number
+  memory_mb?: number
+}
+
 export interface Agent {
   id: string
   projectId: string
@@ -144,6 +155,7 @@ export interface Agent {
   lastHeartbeat?: string
   createdAt: string
   updatedAt: string
+  metrics?: AgentMetrics
 }
 
 export interface CreateAgentInput {
@@ -151,6 +163,16 @@ export interface CreateAgentInput {
   type: AgentType
   name: string
   model?: string
+}
+
+export interface SpawnAgentInput {
+  project_id: string
+  type: AgentType
+  name: string
+  model?: string
+  system_prompt?: string
+  max_tokens?: number
+  temperature?: number
 }
 
 export interface UpdateAgentInput {
@@ -423,6 +445,9 @@ export const agents = {
 
   create: (data: CreateAgentInput) =>
     post<ApiResponse<Agent>>('/api/v1/agents', data),
+
+  spawn: (data: SpawnAgentInput) =>
+    post<ApiResponse<Agent>>('/api/v1/agents/spawn', data),
 
   update: (id: string, data: UpdateAgentInput) =>
     patch<ApiResponse<Agent>>(`/api/v1/agents/${id}`, data),
