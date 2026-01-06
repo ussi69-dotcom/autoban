@@ -6,13 +6,22 @@ from uuid import uuid4, UUID
 from enum import Enum
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.models import User, Project, Task as TaskModel, OrgMember
+from app.config import get_settings
+from app.models import (
+    AgentInstance,
+    AgentStatus as DBAgentStatus,
+    OrgMember,
+    Project,
+    Session as SessionModel,
+    Task as TaskModel,
+    User,
+)
 from app.models.task import TaskStatus as TaskStatusEnum, TaskPriority as TaskPriorityEnum
 from app.api.v1.auth import get_current_user
 
@@ -91,7 +100,12 @@ class TaskStatusChange(BaseModel):
 
 class TaskAssign(BaseModel):
     """Request schema for assigning an agent to a task."""
-    agent_id: str = Field(..., description="Agent ID to assign")
+    model_config = ConfigDict(populate_by_name=True)
+    agent_id: Optional[str] = Field(
+        None,
+        alias="agentId",
+        description="Agent ID to assign (use 'auto' to auto-assign)"
+    )
     auto_start: bool = Field(True, description="Automatically start working on the task")
 
 
@@ -175,6 +189,23 @@ class TaskHistoryResponse(BaseModel):
 # Helper Functions
 # ============================================================================
 
+def agent_to_summary(agent: AgentInstance) -> AgentSummary:
+    """Convert an agent model to summary info."""
+    return AgentSummary(
+        id=str(agent.id),
+        name=f"{agent.agent_type}-{str(agent.id)[:8]}",
+        type=agent.agent_type,
+        status=agent.status.value,
+    )
+
+
+def is_auto_agent_id(agent_id: Optional[str]) -> bool:
+    """Check whether agent_id should auto-select an agent."""
+    if not agent_id:
+        return True
+    return agent_id.strip().lower() in {"auto", "any", "available"}
+
+
 async def verify_project_access(db: AsyncSession, user: User, project_id: str) -> Project:
     """Verify user has access to a project and return it."""
     try:
@@ -208,7 +239,12 @@ async def verify_project_access(db: AsyncSession, user: User, project_id: str) -
     return project
 
 
-def task_to_response(task: TaskModel, project: Project) -> TaskResponse:
+def task_to_response(
+    task: TaskModel,
+    project: Project,
+    assigned_agent: Optional[AgentInstance] = None,
+    session_id: Optional[str] = None,
+) -> TaskResponse:
     """Convert a Task model to TaskResponse."""
     return TaskResponse(
         id=str(task.id),
@@ -222,11 +258,11 @@ def task_to_response(task: TaskModel, project: Project) -> TaskResponse:
         labels=task.labels or [],
         estimated_hours=task.estimated_mins / 60 if task.estimated_mins else None,
         actual_hours=task.actual_mins / 60 if task.actual_mins else None,
-        assigned_agent=None,
+        assigned_agent=agent_to_summary(assigned_agent) if assigned_agent else None,
         parent_task_id=str(task.parent_task_id) if task.parent_task_id else None,
         subtask_count=0,
         completed_subtask_count=0,
-        session_id=None,
+        session_id=session_id,
         created_by=str(task.created_by) if task.created_by else "system",
         created_at=task.created_at,
         updated_at=task.updated_at,
@@ -855,6 +891,7 @@ async def get_task_history(
 async def assign_agent(
     task_id: str,
     request: TaskAssign,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> TaskResponse:
     """
@@ -866,13 +903,147 @@ async def assign_agent(
     - **agent_id**: Agent ID to assign
     - **auto_start**: Start working immediately
     """
-    # TODO: Verify agent is available
-    # TODO: Assign agent to task
-    # TODO: Optionally start work session
+    try:
+        task_uuid = UUID(task_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid task ID format"
+        )
 
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail="Task not found"
+    # Get user's organizations
+    orgs_result = await db.execute(
+        select(OrgMember.org_id).where(OrgMember.user_id == user.id)
+    )
+    user_org_ids = [row[0] for row in orgs_result.fetchall()]
+
+    if not user_org_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found"
+        )
+
+    # Get task with project
+    result = await db.execute(
+        select(TaskModel)
+        .join(Project, TaskModel.project_id == Project.id)
+        .options(selectinload(TaskModel.project))
+        .where(TaskModel.id == task_uuid)
+        .where(Project.org_id.in_(user_org_ids))
+    )
+    task = result.scalar_one_or_none()
+
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found"
+        )
+
+    if task.assigned_agent_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Task already has an assigned agent"
+        )
+
+    settings = get_settings()
+    now = datetime.utcnow()
+
+    agent: Optional[AgentInstance] = None
+
+    if is_auto_agent_id(request.agent_id):
+        available_result = await db.execute(
+            select(AgentInstance)
+            .where(AgentInstance.status == DBAgentStatus.IDLE)
+            .order_by(AgentInstance.started_at.asc())
+        )
+        agent = available_result.scalars().first()
+
+        if not agent:
+            count_result = await db.execute(
+                select(func.count(AgentInstance.id)).where(
+                    AgentInstance.status.in_(
+                        [DBAgentStatus.IDLE, DBAgentStatus.BUSY, DBAgentStatus.INITIALIZING]
+                    )
+                )
+            )
+            active_count = count_result.scalar() or 0
+
+            if active_count >= settings.agent_pool_max_size:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Agent pool at capacity"
+                )
+
+            agent_type = task.recommended_profile or "custom"
+            agent = AgentInstance(
+                agent_type=agent_type,
+                model="custom",
+                status=DBAgentStatus.INITIALIZING,
+                started_at=now,
+                last_heartbeat=now,
+            )
+            db.add(agent)
+            await db.flush()
+
+    else:
+        try:
+            agent_uuid = UUID(request.agent_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid agent ID format"
+            )
+
+        result = await db.execute(
+            select(AgentInstance).where(AgentInstance.id == agent_uuid)
+        )
+        agent = result.scalar_one_or_none()
+
+        if not agent:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Agent not found"
+            )
+
+        if agent.status != DBAgentStatus.IDLE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Agent not available"
+            )
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No available agents"
+        )
+
+    session_status = "active" if request.auto_start else "pending"
+    session = SessionModel(
+        agent_id=agent.id,
+        task_id=task.id,
+        project_id=task.project_id,
+        user_id=user.id,
+        status=session_status,
+    )
+    db.add(session)
+    await db.flush()
+
+    task.assigned_agent_id = agent.id
+    agent.current_task_id = task.id
+    agent.current_session_id = session.id
+    agent.status = DBAgentStatus.BUSY
+    agent.last_heartbeat = now
+
+    if request.auto_start and not task.started_at:
+        task.started_at = now
+
+    await db.commit()
+
+    return task_to_response(
+        task,
+        task.project,
+        assigned_agent=agent,
+        session_id=str(session.id),
     )
 
 
