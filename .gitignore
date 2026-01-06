@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+.next/
+out/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+coverage/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Turbo
+.turbo/
+
+# Python
+venv/
+.venv/
+*.egg
+MANIFEST
+
+# Database
+*.sqlite
+*.db
+
+# Secrets
+*.pem
+*.key
+credentials.json
+
+# Agent workspaces
+workspaces/
