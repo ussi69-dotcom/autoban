@@ -336,10 +336,10 @@ async def spawn_agent(
         project_name = "Unknown Project"
 
     # Check current agent count (max 10 agents)
+    # Use raw SQL to avoid SQLAlchemy enum serialization issues
+    from sqlalchemy import text as sql_text
     count_result = await db.execute(
-        select(func.count(AgentInstance.id)).where(
-            AgentInstance.status.in_([DBAgentStatus.IDLE, DBAgentStatus.BUSY, DBAgentStatus.INITIALIZING])
-        )
+        sql_text("SELECT COUNT(*) FROM agent_instances WHERE status IN ('idle', 'busy', 'initializing')")
     )
     active_count = count_result.scalar() or 0
 

@@ -41,7 +41,7 @@ class AgentInstance(Base):
     agent_type: Mapped[str] = mapped_column(String(100), nullable=False)
     model: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[AgentStatus] = mapped_column(
-        Enum(AgentStatus, name="agent_status", create_type=False),
+        Enum(AgentStatus, name="agent_status", create_type=False, values_callable=lambda x: [e.value for e in x]),
         server_default=text("'initializing'"),
         nullable=False,
     )
