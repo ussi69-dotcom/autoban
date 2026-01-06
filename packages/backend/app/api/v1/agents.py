@@ -163,7 +163,7 @@ async def list_agents(
     if status:
         db_status = DBAgentStatus(status.value) if status.value in [s.value for s in DBAgentStatus] else None
         if db_status:
-            query = query.where(AgentInstance.status == db_status)
+            query = query.where(AgentInstance.status == db_status.value)
 
     if type:
         query = query.where(AgentInstance.agent_type == type.value)
@@ -338,7 +338,13 @@ async def spawn_agent(
     # Check current agent count (max 10 agents)
     count_result = await db.execute(
         select(func.count(AgentInstance.id)).where(
-            AgentInstance.status.in_([DBAgentStatus.IDLE, DBAgentStatus.BUSY, DBAgentStatus.INITIALIZING])
+            AgentInstance.status.in_(
+                [
+                    DBAgentStatus.IDLE.value,
+                    DBAgentStatus.BUSY.value,
+                    DBAgentStatus.INITIALIZING.value,
+                ]
+            )
         )
     )
     active_count = count_result.scalar() or 0
