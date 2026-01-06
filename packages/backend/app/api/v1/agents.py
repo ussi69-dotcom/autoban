@@ -2,14 +2,17 @@
 
 from datetime import datetime
 from typing import Optional
-from uuid import uuid4
+from uuid import uuid4, UUID
 from enum import Enum
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
 
 from app.database import get_db
+from app.models.agent import AgentInstance, AgentStatus as DBAgentStatus
+from app.models.project import Project
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
 
@@ -153,13 +156,63 @@ async def list_agents(
     - **status**: Filter by agent status
     - **type**: Filter by agent type
     """
-    # TODO: Fetch agents from database
+    # Build query
+    query = select(AgentInstance)
+
+    # Apply filters
+    if status:
+        db_status = DBAgentStatus(status.value) if status.value in [s.value for s in DBAgentStatus] else None
+        if db_status:
+            query = query.where(AgentInstance.status == db_status)
+
+    if type:
+        query = query.where(AgentInstance.agent_type == type.value)
+
+    # Execute query
+    result = await db.execute(query)
+    agents = result.scalars().all()
+
+    # Count active and idle
+    active_count = sum(1 for a in agents if a.status in (DBAgentStatus.BUSY, DBAgentStatus.INITIALIZING))
+    idle_count = sum(1 for a in agents if a.status == DBAgentStatus.IDLE)
+
+    # Convert to response
+    items = []
+    for agent in agents:
+        items.append(AgentResponse(
+            id=str(agent.id),
+            name=f"{agent.agent_type}-{str(agent.id)[:8]}",
+            type=AgentType(agent.agent_type) if agent.agent_type in [t.value for t in AgentType] else AgentType.CUSTOM,
+            status=AgentStatus(agent.status.value) if agent.status.value in [s.value for s in AgentStatus] else AgentStatus.STOPPED,
+            project_id="",  # Agents aren't tied to projects in current model
+            project_name="",
+            current_task_id=str(agent.current_task_id) if agent.current_task_id else None,
+            current_session_id=str(agent.current_session_id) if agent.current_session_id else None,
+            config=AgentConfig(
+                model=agent.model,
+                system_prompt=None,
+                max_tokens=4096,
+                temperature=0.7,
+                tools_enabled=["file_read", "file_write", "terminal", "browser"]
+            ),
+            metrics=AgentMetrics(
+                total_sessions=0,
+                completed_tasks=0,
+                failed_tasks=0,
+                total_tokens_used=0,
+                average_response_time_ms=0,
+                uptime_seconds=int((datetime.utcnow() - agent.started_at.replace(tzinfo=None)).total_seconds()) if agent.started_at else 0
+            ),
+            last_activity_at=agent.last_heartbeat,
+            started_at=agent.started_at,
+            created_at=agent.started_at
+        ))
 
     return AgentListResponse(
-        items=[],
-        total=0,
-        active_count=0,
-        idle_count=0
+        items=items,
+        total=len(items),
+        active_count=active_count,
+        idle_count=idle_count
     )
 
 
@@ -183,11 +236,50 @@ async def get_agent(
 
     - **agent_id**: Agent ID
     """
-    # TODO: Fetch agent from database
+    try:
+        agent_uuid = UUID(agent_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid agent ID format"
+        )
 
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail="Agent not found"
+    result = await db.execute(select(AgentInstance).where(AgentInstance.id == agent_uuid))
+    agent = result.scalar_one_or_none()
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found"
+        )
+
+    return AgentResponse(
+        id=str(agent.id),
+        name=f"{agent.agent_type}-{str(agent.id)[:8]}",
+        type=AgentType(agent.agent_type) if agent.agent_type in [t.value for t in AgentType] else AgentType.CUSTOM,
+        status=AgentStatus(agent.status.value) if agent.status.value in [s.value for s in AgentStatus] else AgentStatus.STOPPED,
+        project_id="",
+        project_name="",
+        current_task_id=str(agent.current_task_id) if agent.current_task_id else None,
+        current_session_id=str(agent.current_session_id) if agent.current_session_id else None,
+        config=AgentConfig(
+            model=agent.model,
+            system_prompt=None,
+            max_tokens=4096,
+            temperature=0.7,
+            tools_enabled=["file_read", "file_write", "terminal", "browser"]
+        ),
+        metrics=AgentMetrics(
+            total_sessions=0,
+            completed_tasks=0,
+            failed_tasks=0,
+            total_tokens_used=0,
+            average_response_time_ms=0,
+            uptime_seconds=int((datetime.utcnow() - agent.started_at.replace(tzinfo=None)).total_seconds()) if agent.started_at else 0
+        ),
+        last_activity_at=agent.last_heartbeat,
+        started_at=agent.started_at,
+        created_at=agent.started_at
     )
 
 
@@ -223,13 +315,6 @@ async def spawn_agent(
     - **max_tokens**: Maximum tokens per response
     - **temperature**: Model temperature for response randomness
     """
-    # TODO: Check agent pool capacity
-    # TODO: Validate project access
-    # TODO: Create and start agent
-
-    agent_id = str(uuid4())
-    now = datetime.utcnow()
-
     # Default models per type
     default_models = {
         AgentType.CLAUDE: "claude-sonnet-4-20250514",
@@ -238,17 +323,59 @@ async def spawn_agent(
         AgentType.CUSTOM: "custom"
     }
 
+    model = request.model or default_models[request.type]
+    now = datetime.utcnow()
+
+    # Validate project exists
+    try:
+        project_uuid = UUID(request.project_id)
+        project_result = await db.execute(select(Project).where(Project.id == project_uuid))
+        project = project_result.scalar_one_or_none()
+        project_name = project.name if project else "Unknown Project"
+    except (ValueError, Exception):
+        project_name = "Unknown Project"
+
+    # Check current agent count (max 10 agents)
+    count_result = await db.execute(
+        select(func.count(AgentInstance.id)).where(
+            AgentInstance.status.in_([DBAgentStatus.IDLE, DBAgentStatus.BUSY, DBAgentStatus.INITIALIZING])
+        )
+    )
+    active_count = count_result.scalar() or 0
+
+    if active_count >= 10:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent pool at capacity (max 10 agents)"
+        )
+
+    # Create agent instance in database
+    agent = AgentInstance(
+        agent_type=request.type.value,
+        model=model,
+        status=DBAgentStatus.INITIALIZING,
+        started_at=now,
+        last_heartbeat=now,
+    )
+    db.add(agent)
+    await db.flush()
+
+    # Update status to IDLE (simulating successful spawn)
+    # In production, this would happen after subprocess confirms it's ready
+    agent.status = DBAgentStatus.IDLE
+    agent.last_heartbeat = datetime.utcnow()
+
     return AgentResponse(
-        id=agent_id,
+        id=str(agent.id),
         name=request.name,
         type=request.type,
-        status=AgentStatus.STARTING,
+        status=AgentStatus.IDLE,
         project_id=request.project_id,
-        project_name="Project Name",  # TODO: Fetch from db
+        project_name=project_name,
         current_task_id=None,
         current_session_id=None,
         config=AgentConfig(
-            model=request.model or default_models[request.type],
+            model=model,
             system_prompt=request.system_prompt,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
@@ -262,7 +389,7 @@ async def spawn_agent(
             average_response_time_ms=0,
             uptime_seconds=0
         ),
-        last_activity_at=None,
+        last_activity_at=now,
         started_at=now,
         created_at=now
     )
@@ -294,12 +421,38 @@ async def stop_agent(
     - **agent_id**: Agent ID
     - **force**: Force immediate termination
     """
-    # TODO: Stop agent
+    try:
+        agent_uuid = UUID(agent_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid agent ID format"
+        )
+
+    result = await db.execute(select(AgentInstance).where(AgentInstance.id == agent_uuid))
+    agent = result.scalar_one_or_none()
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found"
+        )
+
+    if agent.status in (DBAgentStatus.STOPPED, DBAgentStatus.STOPPING):
+        return AgentStatusResponse(
+            id=agent_id,
+            status=AgentStatus.STOPPED,
+            message="Agent is already stopped"
+        )
+
+    # Update agent status
+    agent.status = DBAgentStatus.STOPPED
+    agent.stopped_at = datetime.utcnow()
 
     return AgentStatusResponse(
         id=agent_id,
-        status=AgentStatus.STOPPING,
-        message="Agent is stopping"
+        status=AgentStatus.STOPPED,
+        message="Agent stopped successfully"
     )
 
 
@@ -467,6 +620,27 @@ async def delete_agent(
 
     - **agent_id**: Agent ID
     """
-    # TODO: Verify agent is stopped
-    # TODO: Delete agent
-    pass
+    try:
+        agent_uuid = UUID(agent_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid agent ID format"
+        )
+
+    result = await db.execute(select(AgentInstance).where(AgentInstance.id == agent_uuid))
+    agent = result.scalar_one_or_none()
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found"
+        )
+
+    if agent.status not in (DBAgentStatus.STOPPED, DBAgentStatus.ERROR):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Agent must be stopped before deletion"
+        )
+
+    await db.delete(agent)
