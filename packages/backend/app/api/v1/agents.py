@@ -2,14 +2,14 @@
 
 from datetime import datetime
 from typing import Optional
-from uuid import uuid4
 from enum import Enum
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Query
+from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.services.agent_pool import AgentPoolManager, AgentStatus as PoolAgentStatus
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
 
@@ -51,10 +51,15 @@ class LogLevel(str, Enum):
 
 class AgentSpawn(BaseModel):
     """Request schema for spawning a new agent."""
+    model_config = ConfigDict(populate_by_name=True)
     name: str = Field(..., min_length=1, max_length=50, description="Agent name")
-    type: AgentType = Field(AgentType.CLAUDE, description="Type of AI agent")
+    type: AgentType = Field(
+        AgentType.CLAUDE,
+        alias="agent_type",
+        description="Type of AI agent"
+    )
     project_id: str = Field(..., description="Project to assign agent to")
-    model: Optional[str] = Field(None, description="Specific model version")
+    model: Optional[str] = Field(None, min_length=1, max_length=255, description="Specific model version")
     system_prompt: Optional[str] = Field(None, max_length=10000, description="Custom system prompt")
     max_tokens: int = Field(4096, ge=100, le=100000, description="Max tokens per response")
     temperature: float = Field(0.7, ge=0, le=2, description="Model temperature")
@@ -130,6 +135,15 @@ class AgentStatusResponse(BaseModel):
 # ============================================================================
 # Agent Endpoints
 # ============================================================================
+
+POOL_STATUS_TO_API_STATUS = {
+    PoolAgentStatus.INITIALIZING: AgentStatus.STARTING,
+    PoolAgentStatus.IDLE: AgentStatus.IDLE,
+    PoolAgentStatus.BUSY: AgentStatus.RUNNING,
+    PoolAgentStatus.ERROR: AgentStatus.ERROR,
+    PoolAgentStatus.STOPPING: AgentStatus.STOPPING,
+    PoolAgentStatus.STOPPED: AgentStatus.STOPPED,
+}
 
 @router.get(
     "",
@@ -207,6 +221,7 @@ async def get_agent(
 )
 async def spawn_agent(
     request: AgentSpawn,
+    http_request: Request,
     db: AsyncSession = Depends(get_db)
 ) -> AgentResponse:
     """
@@ -216,19 +231,57 @@ async def spawn_agent(
     The agent will be assigned to the specified project.
 
     - **name**: Display name for the agent
-    - **type**: AI provider type (claude, gpt, gemini)
+    - **agent_type**: AI provider type (claude, gpt, gemini)
     - **project_id**: Project to assign agent to
     - **model**: Specific model version (optional)
     - **system_prompt**: Custom system prompt (optional)
     - **max_tokens**: Maximum tokens per response
     - **temperature**: Model temperature for response randomness
     """
-    # TODO: Check agent pool capacity
-    # TODO: Validate project access
-    # TODO: Create and start agent
+    agent_pool = getattr(http_request.app.state, "agent_pool", None)
+    if not isinstance(agent_pool, AgentPoolManager):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent pool unavailable"
+        )
 
-    agent_id = str(uuid4())
+    if len(agent_pool.agents) >= agent_pool.max_agents:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent pool at capacity"
+        )
+
+    try:
+        agent_id = await agent_pool.spawn_agent()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to spawn agent"
+        ) from exc
+
+    if not agent_id:
+        detail = "Agent pool at capacity"
+        if len(agent_pool.agents) < agent_pool.max_agents:
+            detail = "Failed to spawn agent"
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail
+        )
+
+    agent_info = await agent_pool.get_agent_info(agent_id)
+    pool_status = agent_info.status if agent_info else None
+    api_status = POOL_STATUS_TO_API_STATUS.get(pool_status, AgentStatus.STARTING)
     now = datetime.utcnow()
+    started_at = (
+        datetime.utcfromtimestamp(agent_info.started_at)
+        if agent_info and agent_info.started_at
+        else now
+    )
+    last_activity_at = (
+        datetime.utcfromtimestamp(agent_info.last_heartbeat)
+        if agent_info and agent_info.last_heartbeat
+        else None
+    )
 
     # Default models per type
     default_models = {
@@ -242,11 +295,11 @@ async def spawn_agent(
         id=agent_id,
         name=request.name,
         type=request.type,
-        status=AgentStatus.STARTING,
+        status=api_status,
         project_id=request.project_id,
         project_name="Project Name",  # TODO: Fetch from db
         current_task_id=None,
-        current_session_id=None,
+        current_session_id=agent_info.current_session_id if agent_info else None,
         config=AgentConfig(
             model=request.model or default_models[request.type],
             system_prompt=request.system_prompt,
@@ -262,8 +315,8 @@ async def spawn_agent(
             average_response_time_ms=0,
             uptime_seconds=0
         ),
-        last_activity_at=None,
-        started_at=now,
+        last_activity_at=last_activity_at,
+        started_at=started_at,
         created_at=now
     )
 
