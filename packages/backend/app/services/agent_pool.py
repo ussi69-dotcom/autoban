@@ -6,13 +6,19 @@ and automatic restart on failure.
 """
 
 import asyncio
+import json
 import logging
+import os
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Dict, List, Optional
+
+from app.database import AsyncSessionLocal
+from app.models.agent import AgentInstance, AgentStatus as DbAgentStatus
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +66,7 @@ class AgentInfo:
 
     def is_healthy(self, timeout_seconds: float = 30.0) -> bool:
         """Check if the agent is healthy based on heartbeat."""
-        if self.status in (AgentStatus.STOPPED, AgentStatus.STOPPING):
+        if self.status in (AgentStatus.STOPPED, AgentStatus.STOPPING, AgentStatus.ERROR):
             return False
         return (time.time() - self.last_heartbeat) < timeout_seconds
 
@@ -84,6 +90,10 @@ class AgentPoolManager:
         heartbeat_timeout: float = 30.0,
         max_restart_attempts: int = 3,
         agent_command: Optional[List[str]] = None,
+        default_agent_type: str = "implement",
+        default_agent_model: str = "claude-3-5-sonnet-20241022",
+        backend_url: Optional[str] = None,
+        db_session_factory=AsyncSessionLocal,
     ):
         """
         Initialize the agent pool manager.
@@ -95,6 +105,10 @@ class AgentPoolManager:
             heartbeat_timeout: Seconds before considering an agent unhealthy
             max_restart_attempts: Max restarts before giving up on an agent
             agent_command: Command to spawn an agent process
+            default_agent_type: Default agent type for spawned agents
+            default_agent_model: Default model name for spawned agents
+            backend_url: WebSocket URL for agent IPC
+            db_session_factory: Session factory for persisting agent records
         """
         self.min_agents = min_agents
         self.max_agents = max_agents
@@ -102,12 +116,18 @@ class AgentPoolManager:
         self.heartbeat_timeout = heartbeat_timeout
         self.max_restart_attempts = max_restart_attempts
         self.agent_command = agent_command or ["python", "-m", "autoban.agent"]
+        self.default_agent_type = default_agent_type
+        self.default_agent_model = default_agent_model
+        self.backend_url = backend_url
+        self._db_session_factory = db_session_factory
 
         self._agents: Dict[str, AgentInfo] = {}
         self._health_check_task: Optional[asyncio.Task] = None
         self._running = False
         self._lock = asyncio.Lock()
         self._on_agent_status_change: Optional[Callable[[str, AgentStatus], None]] = None
+        self._stdout_tasks: Dict[str, asyncio.Task] = {}
+        self._stderr_tasks: Dict[str, asyncio.Task] = {}
 
     @property
     def agents(self) -> Dict[str, AgentInfo]:
@@ -168,7 +188,11 @@ class AgentPoolManager:
         await asyncio.gather(*[self.stop_agent(aid) for aid in agent_ids])
         logger.info("Agent pool manager stopped")
 
-    async def spawn_agent(self) -> Optional[str]:
+    async def spawn_agent(
+        self,
+        agent_type: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Optional[str]:
         """
         Spawn a new agent process.
 
@@ -185,17 +209,31 @@ class AgentPoolManager:
             self._agents[agent_id] = agent_info
 
         logger.info(f"Spawning agent {agent_id}")
+        agent_type = agent_type or self.default_agent_type
+        model = model or self.default_agent_model
 
         try:
-            # Placeholder: In a real implementation, this would spawn an actual process
-            # For now, we simulate the process spawn
-            process = await self._spawn_process(agent_id)
+            await self._ensure_agent_instance(agent_id, agent_type, model)
+            process = await self._spawn_process(agent_id, agent_type)
+            if process is None:
+                raise RuntimeError("Agent process failed to start")
+            await asyncio.sleep(0.1)
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"Agent process exited early with code {process.returncode}"
+                )
 
             async with self._lock:
                 agent_info.process = process
                 agent_info.status = AgentStatus.IDLE
                 agent_info.update_heartbeat()
 
+            await self._update_agent_instance(
+                agent_id,
+                status=AgentStatus.IDLE,
+                pid=process.pid,
+                last_heartbeat=self._now(),
+            )
             self._notify_status_change(agent_id, AgentStatus.IDLE)
             logger.info(f"Agent {agent_id} spawned and ready")
             return agent_id
@@ -205,14 +243,23 @@ class AgentPoolManager:
             async with self._lock:
                 agent_info.status = AgentStatus.ERROR
                 agent_info.error_message = str(e)
+            await self._update_agent_instance(
+                agent_id,
+                status=AgentStatus.ERROR,
+                error_message=str(e),
+            )
             self._notify_status_change(agent_id, AgentStatus.ERROR)
             return None
 
-    async def _spawn_process(self, agent_id: str) -> Optional[subprocess.Popen]:
+    async def _spawn_process(
+        self,
+        agent_id: str,
+        agent_type: str,
+    ) -> Optional[subprocess.Popen]:
         """
         Spawn the actual agent process.
 
-        This is a placeholder implementation. In production, this would:
+        In production, this would:
         1. Spawn a subprocess running the agent code
         2. Set up IPC channels (pipes, sockets, etc.)
         3. Wait for the agent to signal ready
@@ -223,22 +270,220 @@ class AgentPoolManager:
         Returns:
             The subprocess.Popen object or None
         """
-        # Placeholder: Simulate process spawn with a small delay
-        await asyncio.sleep(0.1)
+        env = os.environ.copy()
+        env["AGENT_ID"] = agent_id
+        env.setdefault("AGENT_TYPE", agent_type)
+        if self.backend_url:
+            env["BACKEND_URL"] = self.backend_url
+        env.setdefault("BACKEND_URL", env.get("BACKEND_URL", "ws://localhost:8000"))
 
-        # In production, uncomment and modify:
-        # env = os.environ.copy()
-        # env["AGENT_ID"] = agent_id
-        # process = subprocess.Popen(
-        #     self.agent_command,
-        #     env=env,
-        #     stdin=subprocess.PIPE,
-        #     stdout=subprocess.PIPE,
-        #     stderr=subprocess.PIPE,
-        # )
-        # return process
+        process = subprocess.Popen(
+            self.agent_command,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
 
-        return None  # Placeholder - no actual process
+        self._stdout_tasks[agent_id] = asyncio.create_task(
+            self._monitor_agent_stdout(agent_id, process)
+        )
+        self._stderr_tasks[agent_id] = asyncio.create_task(
+            self._monitor_agent_stderr(agent_id, process)
+        )
+        return process
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _parse_uuid(self, value: Optional[str]) -> Optional[uuid.UUID]:
+        if not value:
+            return None
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            return None
+
+    def _map_status(self, status: AgentStatus) -> DbAgentStatus:
+        return DbAgentStatus(status.value)
+
+    async def _ensure_agent_instance(
+        self,
+        agent_id: str,
+        agent_type: str,
+        model: str,
+    ) -> None:
+        if not self._db_session_factory:
+            return
+        agent_uuid = self._parse_uuid(agent_id)
+        if not agent_uuid:
+            return
+        try:
+            async with self._db_session_factory() as session:
+                instance = await session.get(AgentInstance, agent_uuid)
+                if instance:
+                    instance.status = DbAgentStatus.INITIALIZING
+                    instance.agent_type = agent_type
+                    instance.model = model
+                    instance.last_heartbeat = self._now()
+                else:
+                    session.add(
+                        AgentInstance(
+                            id=agent_uuid,
+                            agent_type=agent_type,
+                            model=model,
+                            status=DbAgentStatus.INITIALIZING,
+                            last_heartbeat=self._now(),
+                        )
+                    )
+                await session.commit()
+        except Exception as exc:
+            logger.warning(f"Failed to persist agent instance {agent_id}: {exc}")
+
+    async def _update_agent_instance(self, agent_id: str, **updates) -> None:
+        if not self._db_session_factory:
+            return
+        agent_uuid = self._parse_uuid(agent_id)
+        if not agent_uuid:
+            return
+        if not updates:
+            return
+        try:
+            async with self._db_session_factory() as session:
+                instance = await session.get(AgentInstance, agent_uuid)
+                if not instance:
+                    return
+                if "status" in updates:
+                    status_value = updates.pop("status")
+                    if isinstance(status_value, AgentStatus):
+                        updates["status"] = self._map_status(status_value)
+                    elif isinstance(status_value, DbAgentStatus):
+                        updates["status"] = status_value
+                    elif isinstance(status_value, str):
+                        try:
+                            updates["status"] = DbAgentStatus(status_value)
+                        except ValueError:
+                            pass
+                if "last_heartbeat" in updates:
+                    heartbeat = updates["last_heartbeat"]
+                    if isinstance(heartbeat, (int, float)):
+                        updates["last_heartbeat"] = datetime.fromtimestamp(
+                            heartbeat, tz=timezone.utc
+                        )
+                if "current_session_id" in updates:
+                    updates["current_session_id"] = self._parse_uuid(
+                        updates["current_session_id"]
+                    )
+                for key, value in updates.items():
+                    setattr(instance, key, value)
+                await session.commit()
+        except Exception as exc:
+            logger.warning(f"Failed to update agent instance {agent_id}: {exc}")
+
+    async def _monitor_agent_stdout(
+        self,
+        agent_id: str,
+        process: subprocess.Popen,
+    ) -> None:
+        if not process.stdout:
+            return
+        try:
+            while True:
+                line = await asyncio.to_thread(process.stdout.readline)
+                if not line:
+                    break
+                text = line.strip()
+                if not text:
+                    continue
+                await self._handle_agent_output(agent_id, text)
+        finally:
+            self._stdout_tasks.pop(agent_id, None)
+            await self._handle_process_exit(agent_id, process)
+
+    async def _monitor_agent_stderr(
+        self,
+        agent_id: str,
+        process: subprocess.Popen,
+    ) -> None:
+        if not process.stderr:
+            return
+        try:
+            while True:
+                line = await asyncio.to_thread(process.stderr.readline)
+                if not line:
+                    break
+                text = line.strip()
+                if text:
+                    logger.warning(f"Agent {agent_id} stderr: {text}")
+        finally:
+            self._stderr_tasks.pop(agent_id, None)
+            return
+
+    async def _handle_agent_output(self, agent_id: str, text: str) -> None:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            logger.debug(f"Agent {agent_id} output: {text}")
+            return
+
+        message_type = payload.get("type")
+        message_payload = payload.get("payload", payload)
+        if message_type == "heartbeat":
+            await self.update_heartbeat(agent_id)
+            cpu = message_payload.get("cpu_percent", message_payload.get("cpuPercent"))
+            memory = message_payload.get("memory_mb", message_payload.get("memoryMb"))
+            if cpu is not None and memory is not None:
+                await self.update_resources(agent_id, float(cpu), float(memory))
+            return
+
+        if message_type == "status":
+            status_value = message_payload.get("status")
+            if status_value:
+                try:
+                    status = AgentStatus(status_value)
+                except ValueError:
+                    return
+                await self._set_agent_status(agent_id, status)
+
+    async def _handle_process_exit(
+        self,
+        agent_id: str,
+        process: subprocess.Popen,
+    ) -> None:
+        async with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent or agent.status in (AgentStatus.STOPPING, AgentStatus.STOPPED):
+                return
+            agent.status = AgentStatus.ERROR
+            agent.error_message = f"Process exited with code {process.returncode}"
+            agent.last_heartbeat = 0.0
+        await self._update_agent_instance(
+            agent_id,
+            status=AgentStatus.ERROR,
+            error_message=f"Process exited with code {process.returncode}",
+            stopped_at=self._now(),
+        )
+        self._notify_status_change(agent_id, AgentStatus.ERROR)
+
+    async def _set_agent_status(self, agent_id: str, status: AgentStatus) -> None:
+        async with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent:
+                return
+            agent.status = status
+        await self._update_agent_instance(agent_id, status=status)
+        self._notify_status_change(agent_id, status)
+
+    async def _cancel_agent_tasks(self, agent_id: str) -> None:
+        task = self._stdout_tasks.pop(agent_id, None)
+        if task:
+            task.cancel()
+        task = self._stderr_tasks.pop(agent_id, None)
+        if task:
+            task.cancel()
 
     async def stop_agent(self, agent_id: str, force: bool = False) -> bool:
         """
@@ -266,9 +511,17 @@ class AgentPoolManager:
         logger.info(f"Stopping agent {agent_id} (force={force})")
 
         try:
+            await self._update_agent_instance(agent_id, status=AgentStatus.STOPPING)
             if agent.process:
                 if force:
                     agent.process.kill()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(agent.process.wait),
+                            timeout=5.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Agent {agent_id} did not exit after kill")
                 else:
                     agent.process.terminate()
                     try:
@@ -280,12 +533,20 @@ class AgentPoolManager:
                     except asyncio.TimeoutError:
                         logger.warning(f"Agent {agent_id} did not stop gracefully, killing")
                         agent.process.kill()
+                await self._cancel_agent_tasks(agent_id)
 
             async with self._lock:
                 agent.status = AgentStatus.STOPPED
                 self._notify_status_change(agent_id, AgentStatus.STOPPED)
                 del self._agents[agent_id]
 
+            await self._update_agent_instance(
+                agent_id,
+                status=AgentStatus.STOPPED,
+                stopped_at=self._now(),
+                current_session_id=None,
+                pid=None,
+            )
             logger.info(f"Agent {agent_id} stopped")
             return True
 
@@ -337,6 +598,11 @@ class AgentPoolManager:
             agent.current_session_id = session_id
             self._notify_status_change(agent_id, AgentStatus.BUSY)
 
+        await self._update_agent_instance(
+            agent_id,
+            status=AgentStatus.BUSY,
+            current_session_id=session_id,
+        )
         logger.info(f"Agent {agent_id} assigned to session {session_id}")
         return True
 
@@ -359,6 +625,11 @@ class AgentPoolManager:
             agent.current_session_id = None
             self._notify_status_change(agent_id, AgentStatus.IDLE)
 
+        await self._update_agent_instance(
+            agent_id,
+            status=AgentStatus.IDLE,
+            current_session_id=None,
+        )
         logger.info(f"Agent {agent_id} released to idle")
         return True
 
@@ -377,6 +648,8 @@ class AgentPoolManager:
             if not agent:
                 return False
             agent.update_heartbeat()
+            heartbeat = agent.last_heartbeat
+        await self._update_agent_instance(agent_id, last_heartbeat=heartbeat)
         return True
 
     async def update_resources(
@@ -398,6 +671,11 @@ class AgentPoolManager:
             if not agent:
                 return False
             agent.resources.update(cpu_percent, memory_mb)
+        await self._update_agent_instance(
+            agent_id,
+            cpu_percent=cpu_percent,
+            memory_mb=memory_mb,
+        )
         return True
 
     async def get_agent_status(self, agent_id: str) -> Optional[AgentStatus]:
@@ -441,13 +719,30 @@ class AgentPoolManager:
         """Check health of all agents and restart unhealthy ones."""
         async with self._lock:
             agents_to_restart = []
+            agents_to_mark_error = []
 
             for agent_id, agent in self._agents.items():
                 if agent.status in (AgentStatus.STOPPING, AgentStatus.STOPPED):
                     continue
 
+                if agent.process and agent.process.poll() is not None:
+                    exit_code = agent.process.returncode
+                    agent.status = AgentStatus.ERROR
+                    agent.error_message = f"Process exited with code {exit_code}"
+                    agents_to_mark_error.append((agent_id, agent.error_message))
+                    self._notify_status_change(agent_id, AgentStatus.ERROR)
+                    if agent.restart_count < self.max_restart_attempts:
+                        agents_to_restart.append(agent_id)
+                    else:
+                        self._notify_status_change(agent_id, AgentStatus.ERROR)
+                    continue
+
                 if not agent.is_healthy(self.heartbeat_timeout):
                     logger.warning(f"Agent {agent_id} failed health check")
+                    agent.status = AgentStatus.ERROR
+                    agent.error_message = "Heartbeat timeout"
+                    agents_to_mark_error.append((agent_id, agent.error_message))
+                    self._notify_status_change(agent_id, AgentStatus.ERROR)
 
                     if agent.restart_count < self.max_restart_attempts:
                         agents_to_restart.append(agent_id)
@@ -455,9 +750,17 @@ class AgentPoolManager:
                         logger.error(
                             f"Agent {agent_id} exceeded max restart attempts, marking as error"
                         )
-                        agent.status = AgentStatus.ERROR
                         agent.error_message = "Exceeded max restart attempts"
+                        agents_to_mark_error.append((agent_id, agent.error_message))
                         self._notify_status_change(agent_id, AgentStatus.ERROR)
+
+        for agent_id, error_message in agents_to_mark_error:
+            await self._update_agent_instance(
+                agent_id,
+                status=AgentStatus.ERROR,
+                error_message=error_message,
+                stopped_at=self._now(),
+            )
 
         # Restart unhealthy agents outside the lock
         for agent_id in agents_to_restart:
@@ -483,6 +786,10 @@ class AgentPoolManager:
                 new_agent = self._agents.get(new_agent_id)
                 if new_agent:
                     new_agent.restart_count = restart_count + 1
+            await self._update_agent_instance(
+                new_agent_id,
+                restart_count=restart_count + 1,
+            )
 
     async def _ensure_minimum_agents(self) -> None:
         """Ensure we have at least the minimum number of healthy agents."""
