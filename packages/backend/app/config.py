@@ -48,6 +48,7 @@ class Settings(BaseSettings):
         "https://autoban.learnai.cz",
         "https://www.autoban.learnai.cz",
     ]
+    cors_origin_regex: Optional[str] = r"^https?://(.+\.)?learnai\.cz$"
 
     class Config:
         env_file = ".env"
