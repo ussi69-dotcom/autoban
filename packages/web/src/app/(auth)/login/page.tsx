@@ -2,12 +2,13 @@
 
 import Link from "next/link";
 import { useState } from "react";
+import { getApiBaseUrl } from "@/lib/api-base";
 
 export default function LoginPage() {
   const [loading, setLoading] = useState<'github' | 'google' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
+  const apiBaseUrl = getApiBaseUrl();
 
   const handleOAuthLogin = async (provider: 'github' | 'google') => {
     setLoading(provider);

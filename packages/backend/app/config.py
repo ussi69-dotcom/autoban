@@ -42,7 +42,12 @@ class Settings(BaseSettings):
     google_ai_api_key: Optional[str] = None
 
     # CORS
-    cors_origins: list[str] = ["http://localhost:3002", "http://localhost:3000"]
+    cors_origins: list[str] = [
+        "http://localhost:3002",
+        "http://localhost:3000",
+        "https://autoban.learnai.cz",
+        "https://www.autoban.learnai.cz",
+    ]
 
     class Config:
         env_file = ".env"

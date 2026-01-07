@@ -1,6 +1,6 @@
 // API Client with typed fetch wrapper
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001'
+import { getApiBaseUrl } from '@/lib/api-base'
 
 // ============================================================================
 // Types
@@ -247,7 +247,7 @@ async function request<T>(endpoint: string, options: RequestOptions = {}): Promi
   const { body, params, headers: customHeaders, ...restOptions } = options
 
   // Build URL with query params
-  const url = new URL(endpoint, BASE_URL)
+  const url = new URL(endpoint, getApiBaseUrl())
   if (params) {
     Object.entries(params).forEach(([key, value]) => {
       if (value !== undefined) {

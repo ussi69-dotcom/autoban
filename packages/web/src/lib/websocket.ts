@@ -1,5 +1,7 @@
 // WebSocket Client with connection management and channel subscriptions
 
+import { getApiBaseUrl } from '@/lib/api-base'
+
 type MessageHandler = (data: unknown) => void
 type ConnectionHandler = () => void
 type ErrorHandler = (error: Event) => void
@@ -47,7 +49,7 @@ class WebSocketManager {
 
   constructor() {
     const wsProtocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001'
+    const apiUrl = getApiBaseUrl()
     const host = apiUrl.replace(/^https?:\/\//, '')
     this.url = `${wsProtocol}//${host}/ws`
   }
