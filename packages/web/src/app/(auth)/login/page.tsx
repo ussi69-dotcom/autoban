@@ -2,20 +2,17 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { getApiBaseUrl } from "@/lib/api-base";
 
 export default function LoginPage() {
   const [loading, setLoading] = useState<'github' | 'google' | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  const apiBaseUrl = getApiBaseUrl();
 
   const handleOAuthLogin = async (provider: 'github' | 'google') => {
     setLoading(provider);
     setError(null);
 
     try {
-      const response = await fetch(`${apiBaseUrl}/api/v1/auth/login/${provider}`);
+      const response = await fetch(`/api/auth/login/${provider}`);
 
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
