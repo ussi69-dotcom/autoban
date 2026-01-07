@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { getApiBaseUrl } from '@/lib/api-base'
 
 function getBaseUrl(request: NextRequest): string {
   // Use X-Forwarded headers from Cloudflare/proxy, or fall back to request URL
@@ -31,7 +32,9 @@ export async function GET(request: NextRequest) {
 
   try {
     // Exchange code for token with backend
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'https://autoban-api.learnai.cz'
+    const requestHost = request.headers.get('x-forwarded-host') || request.headers.get('host') || request.nextUrl.host
+    const protocol = request.headers.get('x-forwarded-proto') || request.nextUrl.protocol
+    const apiUrl = getApiBaseUrl({ hostname: requestHost ?? undefined, protocol: protocol ?? undefined })
     const response = await fetch(
       `${apiUrl}/api/v1/auth/callback/github?code=${code}&state=${state}`,
       { method: 'GET' }
@@ -49,8 +52,8 @@ export async function GET(request: NextRequest) {
     const redirectResponse = NextResponse.redirect(`${baseUrl}/dashboard`)
 
     // Determine cookie domain for cross-subdomain sharing
-    const host = request.headers.get('host') || ''
-    const isProduction = host.includes('learnai.cz')
+    const cookieHost = request.headers.get('host') || ''
+    const isProduction = cookieHost.includes('learnai.cz')
     const cookieDomain = isProduction ? '.learnai.cz' : undefined
 
     // Set auth cookie - sameSite: 'none' required for cross-origin API requests
