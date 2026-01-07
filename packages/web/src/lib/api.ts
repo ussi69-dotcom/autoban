@@ -28,6 +28,28 @@ export interface PaginationParams {
   [key: string]: string | number | boolean | undefined
 }
 
+// File browser types
+export type FileEntryType = 'file' | 'directory'
+
+export interface FileEntry {
+  name: string
+  path: string
+  type: FileEntryType
+  extension?: string | null
+  size?: number
+  hasChildren?: boolean
+}
+
+export interface FileTreeResponse {
+  path: string
+  entries: FileEntry[]
+}
+
+export interface FileContentResponse {
+  path: string
+  content: string
+}
+
 // Organization types
 export interface Organization {
   id: string
@@ -474,6 +496,25 @@ export const sessions = {
 }
 
 // ============================================================================
+// Files API
+// ============================================================================
+
+function encodePath(path: string) {
+  return path
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/')
+}
+
+export const files = {
+  list: (path?: string) =>
+    get<ApiResponse<FileTreeResponse>>('/api/v1/files', path ? { path } : undefined),
+
+  getContent: (path: string) =>
+    get<ApiResponse<FileContentResponse>>(`/api/v1/files/${encodePath(path)}`),
+}
+
+// ============================================================================
 // Auth API
 // ============================================================================
 
@@ -520,6 +561,7 @@ export const api = {
   tasks,
   agents,
   sessions,
+  files,
   auth,
 }
 

@@ -5,7 +5,7 @@ import logging
 
 from app.config import get_settings
 from app.database import init_db, close_db
-from app.api.v1 import auth, organizations, projects, tasks, agents, sessions
+from app.api.v1 import auth, organizations, projects, tasks, agents, sessions, files
 from app.api.websocket import router as websocket_router
 from app.services.agent_pool import AgentPoolManager
 
@@ -65,6 +65,7 @@ app.include_router(projects.router, prefix=settings.api_v1_prefix)
 app.include_router(tasks.router, prefix=settings.api_v1_prefix)
 app.include_router(agents.router, prefix=settings.api_v1_prefix)
 app.include_router(sessions.router, prefix=settings.api_v1_prefix)
+app.include_router(files.router, prefix=settings.api_v1_prefix)
 
 # WebSocket
 app.include_router(websocket_router)
