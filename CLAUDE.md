@@ -1,5 +1,7 @@
 # AutoBan
 
+> 📋 **Global rules from `~/.claude/CLAUDE.md` apply FIRST**: skill-first, agent-first, document to Notion, use subagents.
+
 AI-powered Kanban board for autonomous software development with coding agents.
 
 ## Instructions for Claude
